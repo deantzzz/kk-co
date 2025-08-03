@@ -1,0 +1,50 @@
+下面按 **层次对比 → 发现问题 → 调整建议** 的顺序，逐项核对您提供的蓝色框架图（下称 *现图*）与之前确认的“船端软硬件五层架构 + 海事级网络拓扑”（下称 *目标架构*）。
+
+| 对比维度         | 现图组件                                                    | 目标架构要求                                                                           | 不符点                                               | 问题影响                                   | 建议调整                                                                                                  |
+| ------------ | ------------------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **数据源 / 采集** | FlinkX / DataX / Flume / Kafka 消费，面向 DB & 日志            | ① MQTT Edge I/O <br/>② Store-&-Forward (Kafka WAL)<br/>③ 断网 48 h 缓冲              | • 无 **MQTT**、**边缘采集箱** 概念 <br/>• 缺乏掉线重投机制         | 传感流（1 Hz–10 Hz）无法落地；海上断链将导致数据丢失        | - 在数据采集层新增 **MQTT 消息桥** 与 **边缘采集节点**；<br/>- 用 **Kafka Connect (Source)** 或 FlinkCDC 替换 Flume，消除组件冗余   |
+| **数据总线**     | Kafka 仅出现在“业务系统 ←Kafka”箭头                               | 统一 **MQTT→Kafka Bridge**；船岸用 MirrorMaker                                         | Kafka 未被列入“数据计算”前的主总线                             | 主题规划、QoS 及 MirrorMaker 策略缺位            | 将 Kafka 上移为“流式总线层”，写明 **Raft 3 节点 + MirrorMaker**                                                     |
+| **数据存储**     | ODS：MySQL / 达梦 / MinIO / Mongo / Redis / HDFS / Influx  | 高频遥测：Influx<br/>事务：Timescale（或 MySQL 分区）<br/>对象：MinIO<br/>时空\&KG：PostGIS + Neo4j | • Redis/HDFS 与目标场景无强需求 <br/>• KG / PostGIS 缺失     | 1. 存储类型过多 → 维护复杂<br/>2. 时空查询无法落地 DT 场景 | - 去掉 **Redis/HDFS**（如确有日志离线备份可用 MinIO Glacier）<br/>- 加入 **PostGIS + Neo4j/JanusGraph** 支撑数字孪生         |
+| **数据计算**     | Hive / Spark-SQL / MapReduce (批)<br/>Flink / Storm (实时) | Spark Structured Streaming（清洗）<br/>无 MapReduce；Storm 可选                          | • MapReduce 已过时 <br/>• Spark 批流分离无须 Hive/MR       | 旧组件占用资源，难在船端维护                         | - 船端仅保留 **Spark Structured Streaming + Flink**<br/>- Hive/MR 移至岸基或淘汰                                  |
+| **治理与服务**    | “数据血缘 / 目录 / 标准”等文字描述                                   | OpenMetadata + API Gateway + NeuVector mTLS                                      | 组件未落地，缺安全网格                                       | 血缘、API一致性与容器零信任缺位                      | - 明确 **OpenMetadata / DataHub** 做血缘<br/>- API Gateway 选 **GraphQL+REST**，加 **NeuVector 或 Istio** 安全网格 |
+| **展现层**      | 智慧大屏（HTTP）、业务系统（Kafka）、私有 API 平台（FTP）                   | Grafana/Loki 船端<br/>WebSocket HMI SDK<br/>双链路 VSAT+5G                            | • 用 FTP 传输私有 API 不安全<br/>• 未体现 WebSocket / PromQL | 低时效或高延迟的数据展示体验                         | - 私有接口改 **REST/WebSocket TLS**<br/>- 智慧大屏接入 **Grafana / WebSocket SDK**                               |
+| **运维 & 调度**  | 统一任务调度中心<br/>统一运维管理中心                                   | K3s 高可用 + Stratus ztC Edge 容错<br/>GitOps / ArgoCD                                | 未说明容器编排和 HA 机制                                    | 难以实现就地热备、自动漂移                          | - 任务调度由 **K3s + Argo Workflows** 负责<br/>- 运维中心整合 **ztC Edge 容错监控 + NeuVector**                        |
+| **网络与安全**    | 未体现                                                     | 四区 (IT/OT/DMZ/访客) + 双 NGFW + mTLS                                                | 网络分段缺席                                            | 不符 IACS UR E26/E27                     | - 图右侧补 **网络分区与 NGFW**，标注 VLAN/ACL                                                                     |
+| **岸基同步**     | FTP / Kafka 箭头                                          | Kafka MirrorMaker + Thanos                                                       | 仅单向了望                                             | 船岸数据延迟/一致性风险                           | - 改 **MirrorMaker 双向增量同步**；<br/>- Thanos 做指标长期汇聚                                                      |
+
+---
+
+### 整体整改方案
+
+1. **新增“流式总线层”**
+   在“数据采集”与“数据计算”之间插入 `MQTT→Kafka Bridge`，标注 **Raft+WAL** 与 **MirrorMaker** 断网补偿。
+
+2. **合并存储类别**
+
+   * 保留 **InfluxDB / Timescale / MinIO**；
+   * 增加 **PostGIS + Neo4j**；
+   * 移除 MapReduce、HDFS、Redis（如确要缓存可在应用侧用 Redis 容器轻量化）。
+
+3. **精简计算引擎**
+
+   * 船端只部署 **Spark Structured Streaming** + **Flink CEP**；
+   * Hive/MapReduce 迁到岸基离线数仓。
+
+4. **落地数据治理**
+
+   * 采用 **OpenMetadata**（或 DataHub）管理血缘与数据目录；
+   * **GraphQL Gateway** 暴露统一 API；
+   * 所有容器经 **NeuVector** 做 mTLS & 微段隔离。
+
+5. **完善可视化与接口**
+
+   * 统一前端框架为 **Grafana/Loki + WebSocket SDK**；
+   * FTP 通道改 REST/HTTPS；
+   * 船岸大屏通过 PromQL/WebSocket 订阅实时指标。
+
+6. **网络安全与运维**
+
+   * 按目标架构把 **IT/OT/DMZ/Guest 四区** 与 **双 NGFW** 画进图中；
+   * 运维中心采用 **ztC Edge 自带 HA + K3s/ArgoCD**。
+
+这样修订后，您的整体架构图即可与先前确定的海事级 **软硬件五层模型 + 断网韧性 + 安全合规** 完全对齐，既保证船端 **48 h 离线自治**，又满足后续 **智能航行 / 能效诊断** 等上层业务的即插即用需求。
